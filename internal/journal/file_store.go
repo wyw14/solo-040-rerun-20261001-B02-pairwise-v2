@@ -62,37 +62,72 @@ func (s *FileStore) snapshotPath(chamberID string) (string, error) {
 }
 
 func (s *FileStore) Append(ctx context.Context, event model.Event) (model.Event, error) {
-	if err := ctx.Err(); err != nil {
-		return model.Event{}, err
-	}
-	path, err := s.eventPath(event.ChamberID)
+	stored, err := s.AppendBatch(ctx, []model.Event{event})
 	if err != nil {
 		return model.Event{}, err
+	}
+	return stored[0], nil
+}
+
+// AppendBatch persists several events from one chamber atomically: they get
+// contiguous sequence numbers and are written and synced in one file write.
+// If the write or sync fails the file is truncated back to its prior length so
+// a partial batch can never become visible on recovery.
+func (s *FileStore) AppendBatch(ctx context.Context, events []model.Event) ([]model.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(events) == 0 {
+		return nil, errors.New("event batch is empty")
+	}
+	chamberID := events[0].ChamberID
+	if chamberID == "" {
+		return nil, errors.New("event chamber is required")
+	}
+	for _, event := range events {
+		if event.ChamberID != chamberID {
+			return nil, errors.New("event batch spans multiple chambers")
+		}
+	}
+	path, err := s.eventPath(chamberID)
+	if err != nil {
+		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	existing, err := readEvents(path)
 	if err != nil {
-		return model.Event{}, err
+		return nil, err
 	}
-	event.Sequence = uint64(len(existing) + 1)
-	encoded, err := json.Marshal(event)
-	if err != nil {
-		return model.Event{}, err
+	buffer := make([]byte, 0, len(events)*256)
+	stored := make([]model.Event, 0, len(events))
+	partitionLength := uint64(len(existing))
+	for _, event := range events {
+		event.Sequence = partitionLength + 1
+		partitionLength++
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			return nil, err
+		}
+		buffer = append(buffer, encoded...)
+		buffer = append(buffer, '\n')
+		stored = append(stored, event)
 	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		return model.Event{}, err
+		return nil, err
 	}
-	if _, err = file.Write(append(encoded, '\n')); err != nil {
-		file.Close()
-		return model.Event{}, err
+	info, statErr := file.Stat()
+	written, writeErr := file.Write(buffer)
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if writeErr != nil || syncErr != nil || closeErr != nil || statErr != nil || uint64(written) != uint64(len(buffer)) {
+		if statErr == nil {
+			_ = os.Truncate(path, info.Size())
+		}
+		return nil, errors.Join(writeErr, syncErr, closeErr)
 	}
-	if err = file.Sync(); err != nil {
-		file.Close()
-		return model.Event{}, err
-	}
-	return event, file.Close()
+	return stored, nil
 }
 
 func readEvents(path string) ([]model.Event, error) {

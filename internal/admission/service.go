@@ -1,45 +1,48 @@
 package admission
 
 import (
-	"context"
-	"time"
-
-	"github.com/wyw14/cry-96/internal/journal"
+	"github.com/google/uuid"
 	"github.com/wyw14/cry-96/internal/model"
 )
 
-// Service records queue changes and delegates safe release decisions.
+// Service coordinates the staged queue with admission decisions. Journaling of
+// plan and signal events belongs to the submit boundary in the schedule
+// planner, so a rejected submit never persists a success event.
 type Service struct {
 	controller *Controller
-	recorder   *journal.Recorder
-	now        func() time.Time
 }
 
-func NewService(controller *Controller, recorder *journal.Recorder, now func() time.Time) *Service {
-	if now == nil {
-		now = time.Now
-	}
-	return &Service{controller: controller, recorder: recorder, now: now}
+func NewService(controller *Controller) *Service {
+	return &Service{controller: controller}
 }
 
-func (s *Service) Enqueue(ctx context.Context, plan model.ConvoyPlan) error {
-	if err := s.controller.queue.Add(plan.ChamberID, plan.ID, plan.Vessels); err != nil {
-		return err
-	}
-	_, err := s.recorder.Record(ctx, plan.ChamberID, model.EventPlanCreated, plan.ID, 0, map[string]any{
-		"plan_id": plan.ID, "queued": len(plan.Vessels), "at": s.now().UTC(),
-	})
-	return err
+// Reserve stages a plan's vessels as invisible queue entries.
+func (s *Service) Reserve(plan model.ConvoyPlan) error {
+	return s.controller.queue.Reserve(plan.ChamberID, plan.ID, plan.Vessels)
 }
 
-func (s *Service) Admit(ctx context.Context, cycle model.TransitCycle) (Decision, error) {
-	decision, err := s.controller.Evaluate(ctx, cycle)
-	if err != nil || !decision.Allowed {
-		return decision, err
-	}
-	_, err = s.recorder.Record(ctx, cycle.ChamberID, model.EventSignalChanged, cycle.ID, cycle.Generation, decision)
-	return decision, err
+// Commit publishes a reservation's entries to the live queue.
+func (s *Service) Commit(planID uuid.UUID) { s.controller.queue.Commit(planID) }
+
+// Abort discards a plan's queue entries after a failed submit. It works
+// whether or not the reservation was committed, so every rollback path is
+// covered.
+func (s *Service) Abort(chamberID string, planID uuid.UUID) {
+	s.controller.queue.RemovePlan(chamberID, planID)
 }
+
+// Preflight reports whether a staged cycle may admit its head vessel.
+func (s *Service) Preflight(cycle model.TransitCycle) Decision {
+	return s.controller.Preflight(cycle)
+}
+
+// Grant commits the proceed aspect for a preflight-approved vessel.
+func (s *Service) Grant(cycle model.TransitCycle, vesselID uuid.UUID) (model.SignalState, error) {
+	return s.controller.Grant(cycle, vesselID)
+}
+
+// Revoke reverts an aspect granted during a submit that is rolling back.
+func (s *Service) Revoke(vesselID uuid.UUID) { s.controller.Revoke(vesselID) }
 
 func (s *Service) RemovePlan(chamberID string, plan model.ConvoyPlan) []QueueEntry {
 	return s.controller.queue.RemovePlan(chamberID, plan.ID)

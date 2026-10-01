@@ -8,6 +8,7 @@ import (
 	"github.com/wyw14/cry-96/internal/gate"
 	"github.com/wyw14/cry-96/internal/model"
 	"github.com/wyw14/cry-96/internal/safety"
+	"github.com/wyw14/cry-96/internal/schedule"
 	"github.com/wyw14/cry-96/internal/signal"
 )
 
@@ -25,23 +26,23 @@ type ChamberView struct {
 type Snapshot struct {
 	cycles  *cycle.Coordinator
 	gates   *gate.State
-	queue   *admission.Service
+	planner *schedule.Planner
 	signals *signal.Service
 	safety  *safety.Service
 	now     func() time.Time
 }
 
-func NewSnapshot(cycles *cycle.Coordinator, gates *gate.State, queue *admission.Service, signals *signal.Service, safetyService *safety.Service, now func() time.Time) *Snapshot {
+func NewSnapshot(cycles *cycle.Coordinator, gates *gate.State, planner *schedule.Planner, signals *signal.Service, safetyService *safety.Service, now func() time.Time) *Snapshot {
 	if now == nil {
 		now = time.Now
 	}
-	return &Snapshot{cycles: cycles, gates: gates, queue: queue, signals: signals, safety: safetyService, now: now}
+	return &Snapshot{cycles: cycles, gates: gates, planner: planner, signals: signals, safety: safetyService, now: now}
 }
 
 func (s *Snapshot) Chamber(chamberID string) ChamberView {
 	view := ChamberView{
 		ChamberID: chamberID, Gates: s.gates.Snapshot(chamberID),
-		Queue: s.queue.List(chamberID), Signals: s.signals.States(),
+		Queue: s.planner.Queue(chamberID), Signals: s.signals.States(),
 		Emergency: s.safety.Status(chamberID), UpdatedAt: s.now().UTC(),
 	}
 	if cycleValue, ok := s.cycles.Current(chamberID); ok {

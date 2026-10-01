@@ -12,6 +12,7 @@ import (
 // Store is the durable boundary used by all stateful coordinators.
 type Store interface {
 	Append(context.Context, model.Event) (model.Event, error)
+	AppendBatch(context.Context, []model.Event) ([]model.Event, error)
 	Events(context.Context, string, uint64) ([]model.Event, error)
 	SaveSnapshot(context.Context, model.ChamberSnapshot) error
 	Snapshot(context.Context, string) (model.ChamberSnapshot, bool, error)
@@ -45,6 +46,38 @@ func (s *MemoryStore) Append(ctx context.Context, event model.Event) (model.Even
 	event.Sequence = uint64(len(partition) + 1)
 	s.events[event.ChamberID] = append(partition, event)
 	return event, nil
+}
+
+// AppendBatch stores several events from one chamber as an atomic unit: they
+// receive contiguous sequence numbers under a single lock, and either all are
+// visible afterwards or none are.
+func (s *MemoryStore) AppendBatch(ctx context.Context, events []model.Event) ([]model.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(events) == 0 {
+		return nil, errors.New("event batch is empty")
+	}
+	chamberID := events[0].ChamberID
+	if chamberID == "" {
+		return nil, errors.New("event chamber is required")
+	}
+	for _, event := range events {
+		if event.ChamberID != chamberID {
+			return nil, errors.New("event batch spans multiple chambers")
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	partition := s.events[chamberID]
+	stored := make([]model.Event, 0, len(events))
+	for _, event := range events {
+		event.Sequence = uint64(len(partition) + 1)
+		partition = append(partition, event)
+		stored = append(stored, event)
+	}
+	s.events[chamberID] = partition
+	return stored, nil
 }
 
 func (s *MemoryStore) Events(ctx context.Context, chamberID string, after uint64) ([]model.Event, error) {

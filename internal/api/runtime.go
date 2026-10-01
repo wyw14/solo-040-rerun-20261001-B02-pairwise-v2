@@ -35,7 +35,6 @@ type Runtime struct {
 	Hydraulics      *hydraulics.Controller
 	Interlocks      *interlock.Coordinator
 	Cycles          *cycle.Coordinator
-	CycleService    *cycle.Service
 	Leases          *lease.Service
 	LeaseSweeper    *lease.Sweeper
 	Safety          *safety.Service
@@ -63,12 +62,10 @@ func NewRuntime(ctx context.Context, dataDirectory string) (*Runtime, error) {
 	signalService := signal.NewService(signalStore)
 	admissionQueue := admission.NewQueue()
 	admissionController := admission.NewController(admissionQueue, gateState, signalStore, now)
-	admissionService := admission.NewService(admissionController, recorder, now)
+	admissionService := admission.NewService(admissionController)
 	leaseRegistry := lease.NewRegistry()
 	leaseService := lease.NewService(leaseRegistry, admissionController, recorder, now)
 	leaseSweeper := lease.NewSweeper(leaseRegistry, now)
-	planner := schedule.NewPlanner(admissionService, recorder, now)
-	scheduleService := schedule.NewService(planner, signalPublisher)
 	ramp := hydraulics.NewRamp(25*time.Millisecond, now)
 	hydraulicsController := hydraulics.NewController(gateCommands, recorder, ramp, now)
 	barrier := safety.NewBarrier()
@@ -88,7 +85,8 @@ func NewRuntime(ctx context.Context, dataDirectory string) (*Runtime, error) {
 		levelByChamber, emergencyActive,
 	)
 	cycleCoordinator := cycle.NewCoordinator(gateController, hydraulicsController, recorder, now)
-	cycleService := cycle.NewService(cycleCoordinator, admissionService)
+	planner := schedule.NewPlanner(admissionService, cycleCoordinator, recorder, now)
+	scheduleService := schedule.NewService(planner, signalPublisher)
 	safetyCoordinator = safety.NewCoordinator(gateCommands, barrier, recorder, now)
 	safetyService := safety.NewService(safetyCoordinator, cycleCoordinator)
 	signalService.BindTransitLookup(cycleCoordinator)
@@ -112,9 +110,9 @@ func NewRuntime(ctx context.Context, dataDirectory string) (*Runtime, error) {
 		SignalStore: signalStore, SignalPublisher: signalPublisher, Signals: signalService,
 		AdmissionQueue: admissionController.Queue(), Admission: admissionService,
 		Planner: planner, Schedule: scheduleService, Hydraulics: hydraulicsController,
-		Interlocks: interlockCoordinator, Cycles: cycleCoordinator, CycleService: cycleService,
+		Interlocks: interlockCoordinator, Cycles: cycleCoordinator,
 		Leases: leaseService, LeaseSweeper: leaseSweeper, Safety: safetyService,
-		Snapshot:  monitor.NewSnapshot(cycleCoordinator, gateState, admissionService, signalService, safetyService, now),
+		Snapshot:  monitor.NewSnapshot(cycleCoordinator, gateState, planner, signalService, safetyService, now),
 		Incidents: monitor.NewIncidentReview(store), Health: health, Recovery: recovery,
 		Chambers: chambers, Now: now,
 	}, nil

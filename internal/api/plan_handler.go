@@ -38,17 +38,12 @@ func createPlanHandler(runtime *Runtime) http.HandlerFunc {
 			}
 			vessels = append(vessels, vessel)
 		}
-		plan, err := runtime.Schedule.Create(r.Context(), input.ChamberID, input.Direction, vessels)
+		submission, err := runtime.Schedule.Submit(r.Context(), input.ChamberID, input.Direction, vessels)
 		if err != nil {
 			writeError(w, http.StatusConflict, err)
 			return
 		}
-		cycleValue, err := runtime.CycleService.Start(r.Context(), plan)
-		if err != nil {
-			writeError(w, http.StatusConflict, err)
-			return
-		}
-		writeJSON(w, http.StatusCreated, map[string]any{"plan": plan, "cycle": cycleValue})
+		writeJSON(w, http.StatusCreated, submission)
 	}
 }
 

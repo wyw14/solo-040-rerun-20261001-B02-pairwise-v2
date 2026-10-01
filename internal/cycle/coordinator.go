@@ -34,22 +34,46 @@ func NewCoordinator(gates *gate.Controller, hydraulicsController *hydraulics.Con
 	}
 }
 
-func (c *Coordinator) Start(ctx context.Context, plan model.ConvoyPlan) (model.TransitCycle, error) {
+// ErrChamberBusy signals that a non-terminal transit already owns a chamber.
+// It is a pure state rejection: no generation was bumped and no cycle stored.
+var ErrChamberBusy = errors.New("chamber already has an active transit")
+
+// Claim reserves the chamber for a new transit generation and runs commit with
+// the reservation in place. The planner uses commit to perform the rest of the
+// submit boundary. If commit fails, the reservation — current cycle and
+// generation bump — is rolled back, leaving the chamber exactly as it was.
+func (c *Coordinator) Claim(ctx context.Context, plan model.ConvoyPlan, commit func(model.TransitCycle) error) (model.TransitCycle, error) {
+	if err := ctx.Err(); err != nil {
+		return model.TransitCycle{}, err
+	}
 	c.mu.Lock()
 	if active, ok := c.current[plan.ChamberID]; ok && !active.Stage.Terminal() {
 		c.mu.Unlock()
-		return model.TransitCycle{}, errors.New("chamber already has an active transit")
+		return model.TransitCycle{}, ErrChamberBusy
 	}
-	c.generations[plan.ChamberID]++
+	previousCycle, hadPrevious := c.current[plan.ChamberID]
+	previousGeneration := c.generations[plan.ChamberID]
+	c.generations[plan.ChamberID] = previousGeneration + 1
 	cycleValue, err := model.NewTransitCycle(plan.ChamberID, plan.ID, plan.Direction, c.generations[plan.ChamberID], c.now())
-	if err == nil {
-		c.current[plan.ChamberID] = cycleValue
-	}
-	c.mu.Unlock()
 	if err != nil {
+		c.generations[plan.ChamberID] = previousGeneration
+		c.mu.Unlock()
 		return model.TransitCycle{}, err
 	}
-	if _, err := c.recorder.Record(ctx, plan.ChamberID, model.EventCycleCreated, cycleValue.ID, cycleValue.Generation, cycleValue); err != nil {
+	c.current[plan.ChamberID] = cycleValue
+	c.mu.Unlock()
+
+	if err := commit(cycleValue); err != nil {
+		c.mu.Lock()
+		if current, ok := c.current[plan.ChamberID]; ok && current.ID == cycleValue.ID {
+			if hadPrevious {
+				c.current[plan.ChamberID] = previousCycle
+			} else {
+				delete(c.current, plan.ChamberID)
+			}
+			c.generations[plan.ChamberID] = previousGeneration
+		}
+		c.mu.Unlock()
 		return model.TransitCycle{}, err
 	}
 	return cycleValue, nil
