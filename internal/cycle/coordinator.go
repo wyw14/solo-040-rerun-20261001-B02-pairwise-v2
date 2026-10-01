@@ -34,25 +34,51 @@ func NewCoordinator(gates *gate.Controller, hydraulicsController *hydraulics.Con
 	}
 }
 
-func (c *Coordinator) Start(ctx context.Context, plan model.ConvoyPlan) (model.TransitCycle, error) {
+// ErrChamberActive rejects a submission while a non-terminal transit owns the
+// chamber. It is a boundary rejection: no callback runs and nothing is staged.
+var ErrChamberActive = errors.New("chamber already has an active transit")
+
+func (c *Coordinator) Submit(
+	ctx context.Context,
+	plan model.ConvoyPlan,
+	commit func(model.TransitCycle) error,
+	rollback func(model.TransitCycle, error),
+) (model.TransitCycle, error) {
+	if err := ctx.Err(); err != nil {
+		return model.TransitCycle{}, err
+	}
 	c.mu.Lock()
 	if active, ok := c.current[plan.ChamberID]; ok && !active.Stage.Terminal() {
 		c.mu.Unlock()
-		return model.TransitCycle{}, errors.New("chamber already has an active transit")
+		return model.TransitCycle{}, ErrChamberActive
 	}
+	previous, hadPrevious := c.current[plan.ChamberID]
 	c.generations[plan.ChamberID]++
-	cycleValue, err := model.NewTransitCycle(plan.ChamberID, plan.ID, plan.Direction, c.generations[plan.ChamberID], c.now())
-	if err == nil {
-		c.current[plan.ChamberID] = cycleValue
+	generation := c.generations[plan.ChamberID]
+	cycleValue, err := model.NewTransitCycle(plan.ChamberID, plan.ID, plan.Direction, generation, c.now())
+	if err != nil {
+		c.generations[plan.ChamberID]--
+		c.mu.Unlock()
+		return model.TransitCycle{}, err
+	}
+	c.current[plan.ChamberID] = cycleValue
+	if err := commit(cycleValue); err != nil {
+		// Restore pre-submission cycle state and unwind staged state while the
+		// boundary is still held, so no concurrent caller can observe it.
+		if hadPrevious {
+			c.current[plan.ChamberID] = previous
+		} else {
+			delete(c.current, plan.ChamberID)
+		}
+		c.generations[plan.ChamberID]--
+		if rollback != nil {
+			rollback(cycleValue, err)
+		}
+		c.mu.Unlock()
+		return model.TransitCycle{}, err
 	}
 	c.mu.Unlock()
-	if err != nil {
-		return model.TransitCycle{}, err
-	}
-	if _, err := c.recorder.Record(ctx, plan.ChamberID, model.EventCycleCreated, cycleValue.ID, cycleValue.Generation, cycleValue); err != nil {
-		return model.TransitCycle{}, err
-	}
-	return cycleValue, nil
+	return cycleValue.Clone(), nil
 }
 
 func (c *Coordinator) Current(chamberID string) (model.TransitCycle, bool) {

@@ -18,7 +18,7 @@ func closeGateHandler(runtime *Runtime) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, errors.New("invalid gate direction"))
 			return
 		}
-		cycleValue, ok := runtime.CycleService.Current(chamberID)
+		cycleValue, ok := runtime.Cycles.Current(chamberID)
 		if !ok {
 			writeError(w, http.StatusConflict, errors.New("active transit not found"))
 			return

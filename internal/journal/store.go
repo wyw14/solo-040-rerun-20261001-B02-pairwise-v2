@@ -12,6 +12,7 @@ import (
 // Store is the durable boundary used by all stateful coordinators.
 type Store interface {
 	Append(context.Context, model.Event) (model.Event, error)
+	AppendBatch(context.Context, []model.Event) ([]model.Event, error)
 	Events(context.Context, string, uint64) ([]model.Event, error)
 	SaveSnapshot(context.Context, model.ChamberSnapshot) error
 	Snapshot(context.Context, string) (model.ChamberSnapshot, bool, error)
@@ -33,18 +34,42 @@ func NewMemoryStore() *MemoryStore {
 }
 
 func (s *MemoryStore) Append(ctx context.Context, event model.Event) (model.Event, error) {
-	if err := ctx.Err(); err != nil {
+	stamped, err := s.AppendBatch(ctx, []model.Event{event})
+	if err != nil {
 		return model.Event{}, err
 	}
-	if event.ChamberID == "" {
-		return model.Event{}, errors.New("event chamber is required")
+	return stamped[0], nil
+}
+
+// AppendBatch stamps and stores a single chamber's events under one lock so
+// they are visible consecutively or not at all.
+func (s *MemoryStore) AppendBatch(ctx context.Context, events []model.Event) ([]model.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(events) == 0 {
+		return nil, errors.New("batch requires at least one event")
+	}
+	chamberID := events[0].ChamberID
+	if chamberID == "" {
+		return nil, errors.New("event chamber is required")
+	}
+	for _, event := range events[1:] {
+		if event.ChamberID != chamberID {
+			return nil, errors.New("batch events must share one chamber")
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	partition := s.events[event.ChamberID]
-	event.Sequence = uint64(len(partition) + 1)
-	s.events[event.ChamberID] = append(partition, event)
-	return event, nil
+	partition := s.events[chamberID]
+	stamped := make([]model.Event, len(events))
+	for index, event := range events {
+		event.ChamberID = chamberID
+		event.Sequence = uint64(len(partition) + index + 1)
+		stamped[index] = event
+	}
+	s.events[chamberID] = append(partition, stamped...)
+	return stamped, nil
 }
 
 func (s *MemoryStore) Events(ctx context.Context, chamberID string, after uint64) ([]model.Event, error) {

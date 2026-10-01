@@ -26,7 +26,34 @@ func (r *Recorder) Record(ctx context.Context, chamberID string, kind model.Even
 	if err != nil {
 		return model.Event{}, err
 	}
-	return r.store.Append(ctx, event)
+	stamped, err := r.store.AppendBatch(ctx, []model.Event{event})
+	if err != nil {
+		return model.Event{}, err
+	}
+	return stamped[0], nil
+}
+
+// EventSpec describes one event in a RecordBatch write.
+type EventSpec struct {
+	Kind       model.EventType
+	CycleID    uuid.UUID
+	Generation uint64
+	Payload    any
+}
+
+// RecordBatch persists several events of one chamber atomically: callers
+// either see every stamped event or none.
+func (r *Recorder) RecordBatch(ctx context.Context, chamberID string, specs []EventSpec) ([]model.Event, error) {
+	now := r.now()
+	events := make([]model.Event, len(specs))
+	for index, spec := range specs {
+		event, err := model.NewEvent(chamberID, spec.Kind, spec.CycleID, spec.Generation, spec.Payload, now)
+		if err != nil {
+			return nil, err
+		}
+		events[index] = event
+	}
+	return r.store.AppendBatch(ctx, events)
 }
 
 func (r *Recorder) Save(ctx context.Context, snapshot model.ChamberSnapshot) error {

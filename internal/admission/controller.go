@@ -17,6 +17,12 @@ type Decision struct {
 	VesselID uuid.UUID `json:"vessel_id,omitempty"`
 }
 
+// ErrNotAdmitted reports that a submission could not be admitted and leaves no
+// state behind; the reason is operator-facing.
+type ErrNotAdmitted struct{ Reason string }
+
+func (e *ErrNotAdmitted) Error() string { return e.Reason }
+
 // Controller grants admission only from observed sealed gate positions.
 type Controller struct {
 	queue   *Queue
@@ -32,25 +38,46 @@ func NewController(queue *Queue, gates *gate.State, signals *signal.Store, now f
 	return &Controller{queue: queue, gates: gates, signals: signals, now: now}
 }
 
-func (c *Controller) Evaluate(ctx context.Context, cycle model.TransitCycle) (Decision, error) {
+// Commit admits a freshly submitted plan while the chamber submit boundary is
+// held. The gates check, field signal and queue release settle together with
+// the caller's journaled event; on failure nothing is marked admitted. It must
+// not take any lock held across the surrounding boundary. It returns the
+// applied proceed state so the caller can journal it, and rolls the signal
+// back itself if the queue cannot be marked.
+func (c *Controller) Commit(ctx context.Context, plan model.ConvoyPlan, cycle model.TransitCycle) (Decision, model.SignalState, *model.SignalState, error) {
 	if err := ctx.Err(); err != nil {
-		return Decision{}, err
+		return Decision{}, model.SignalState{}, nil, err
 	}
 	entry, ok := c.queue.Peek(cycle.ChamberID)
 	if !ok {
-		return Decision{Reason: "queue empty"}, nil
+		return Decision{}, model.SignalState{}, nil, &ErrNotAdmitted{Reason: "queue empty"}
 	}
 	if entry.PlanID != cycle.PlanID {
-		return Decision{VesselID: entry.Vessel.ID, Reason: "head vessel belongs to another plan"}, nil
+		return Decision{}, model.SignalState{}, nil, &ErrNotAdmitted{Reason: "head vessel belongs to another plan"}
 	}
 	if !c.gates.Sealed(cycle.ChamberID) {
-		return Decision{VesselID: entry.Vessel.ID, Reason: "chamber gates are not sealed"}, nil
+		return Decision{}, model.SignalState{}, nil, &ErrNotAdmitted{Reason: "chamber gates are not sealed"}
+	}
+	var prior *model.SignalState
+	if previous, hadPrevious := c.signals.Get(entry.Vessel.ID); hadPrevious {
+		prior = &previous
 	}
 	state := c.signals.Set(entry.Vessel.ID, cycle.ID, cycle.Generation, model.SignalProceed, c.now())
 	if state.Aspect != model.SignalProceed || !c.queue.MarkReleased(cycle.ChamberID, entry.Vessel.ID) {
-		return Decision{}, errors.New("failed to commit admission decision")
+		c.RestoreSignal(entry.Vessel.ID, prior)
+		return Decision{}, model.SignalState{}, nil, errors.New("failed to commit admission decision")
 	}
-	return Decision{Allowed: true, VesselID: entry.Vessel.ID, Reason: "sealed chamber ready"}, nil
+	return Decision{Allowed: true, VesselID: entry.Vessel.ID, Reason: "sealed chamber ready"}, state, prior, nil
+}
+
+// RestoreSignal reinstates the signal a vessel held before a submission, or
+// removes it when the vessel had none.
+func (c *Controller) RestoreSignal(vesselID uuid.UUID, previous *model.SignalState) {
+	if previous != nil {
+		c.signals.Set(previous.VesselID, previous.CycleID, previous.Generation, previous.Aspect, c.now())
+		return
+	}
+	c.signals.Remove(vesselID)
 }
 
 func (c *Controller) OwnerAllowed(vesselID uuid.UUID, owner string, token uint64, lease model.Lease, now time.Time) bool {

@@ -19,8 +19,8 @@ func NewService(planner *Planner, publisher *signal.Publisher) *Service {
 	return &Service{planner: planner, publisher: publisher}
 }
 
-func (s *Service) Create(ctx context.Context, chamberID string, direction model.Direction, vessels []model.Vessel) (model.ConvoyPlan, error) {
-	return s.planner.Create(ctx, chamberID, direction, vessels)
+func (s *Service) Submit(ctx context.Context, chamberID string, direction model.Direction, vessels []model.Vessel) (model.ConvoyPlan, model.TransitCycle, error) {
+	return s.planner.Submit(ctx, chamberID, direction, vessels)
 }
 
 func (s *Service) Publish(ctx context.Context, planID uuid.UUID, cycle model.TransitCycle) (signal.Publication, error) {

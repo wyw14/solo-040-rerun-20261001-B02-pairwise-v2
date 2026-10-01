@@ -62,37 +62,76 @@ func (s *FileStore) snapshotPath(chamberID string) (string, error) {
 }
 
 func (s *FileStore) Append(ctx context.Context, event model.Event) (model.Event, error) {
-	if err := ctx.Err(); err != nil {
-		return model.Event{}, err
-	}
-	path, err := s.eventPath(event.ChamberID)
+	stamped, err := s.AppendBatch(ctx, []model.Event{event})
 	if err != nil {
 		return model.Event{}, err
+	}
+	return stamped[0], nil
+}
+
+// AppendBatch persists a single chamber's events as one replace-and-rename so
+// readers either see the whole batch or none, never a torn sequence gap.
+func (s *FileStore) AppendBatch(ctx context.Context, events []model.Event) ([]model.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(events) == 0 {
+		return nil, errors.New("batch requires at least one event")
+	}
+	chamberID := events[0].ChamberID
+	if chamberID == "" {
+		return nil, errors.New("event chamber is required")
+	}
+	for _, event := range events[1:] {
+		if event.ChamberID != chamberID {
+			return nil, errors.New("batch events must share one chamber")
+		}
+	}
+	path, err := s.eventPath(chamberID)
+	if err != nil {
+		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	existing, err := readEvents(path)
 	if err != nil {
-		return model.Event{}, err
+		return nil, err
 	}
-	event.Sequence = uint64(len(existing) + 1)
-	encoded, err := json.Marshal(event)
+	stamped := make([]model.Event, len(events))
+	for index, event := range events {
+		event.ChamberID = chamberID
+		event.Sequence = uint64(len(existing) + index + 1)
+		stamped[index] = event
+	}
+	builder := &strings.Builder{}
+	for _, event := range append(append([]model.Event(nil), existing...), stamped...) {
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			return nil, err
+		}
+		builder.Write(encoded)
+		builder.WriteByte('\n')
+	}
+	temporary := path + ".new"
+	file, err := os.OpenFile(temporary, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
-		return model.Event{}, err
+		return nil, err
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return model.Event{}, err
-	}
-	if _, err = file.Write(append(encoded, '\n')); err != nil {
+	if _, err = file.WriteString(builder.String()); err != nil {
 		file.Close()
-		return model.Event{}, err
+		return nil, err
 	}
 	if err = file.Sync(); err != nil {
 		file.Close()
-		return model.Event{}, err
+		return nil, err
 	}
-	return event, file.Close()
+	if err = file.Close(); err != nil {
+		return nil, err
+	}
+	if err = os.Rename(temporary, path); err != nil {
+		return nil, err
+	}
+	return stamped, nil
 }
 
 func readEvents(path string) ([]model.Event, error) {
